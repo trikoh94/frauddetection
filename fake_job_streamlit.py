@@ -8,13 +8,37 @@ import pickle
 import pandas as pd
 import numpy as np
 import re
-from textblob import TextBlob
+
 from functools import lru_cache
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
 import warnings
 warnings.filterwarnings('ignore')
+# NLTK 초기화 (Streamlit Cloud용)
+import nltk
+import ssl
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
+@st.cache_resource
+def download_nltk_data():
+    for pkg in ['brown', 'punkt', 'wordnet', 'averaged_perceptron_tagger']:
+        try:
+            nltk.data.find(f'corpora/{pkg}')
+        except:
+            try:
+                nltk.data.find(f'tokenizers/{pkg}')
+            except:
+                nltk.download(pkg, quiet=True)
+
+download_nltk_data()
+
+# 이제 TextBlob import
+from textblob import TextBlob
 # ============================================================================
 # 필수: 학습 시 사용한 클래스들 (pickle 로드 전에 정의 필요!)
 # ============================================================================
