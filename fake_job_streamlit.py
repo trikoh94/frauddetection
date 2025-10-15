@@ -1,6 +1,6 @@
 """
-Job Posting Fraud Detection Dashboard
-Streamlit App with 2-Stage Defense System
+Job Posting Fraud Detection Dashboard v7 - FIXED
+모델 로딩 호환성 문제 해결
 """
 
 import streamlit as st
@@ -10,14 +10,18 @@ import numpy as np
 import re
 from textblob import TextBlob
 from functools import lru_cache
-from datetime import datetime
+from sentence_transformers import SentenceTransformer
+from sklearn.decomposition import PCA
+import warnings
+warnings.filterwarnings('ignore')
 
 # ============================================================================
-# Core Functions & Classes
+# 필수: 학습 시 사용한 클래스들 (pickle 로드 전에 정의 필요!)
 # ============================================================================
 
 @lru_cache(maxsize=1000)
 def get_sentiment(text):
+    """캐싱된 감성 분석"""
     try:
         blob = TextBlob(text)
         return blob.sentiment.polarity, blob.sentiment.subjectivity
@@ -26,6 +30,7 @@ def get_sentiment(text):
 
 
 class FeatureExtractor:
+    """도메인 특성 추출기"""
     def __init__(self, keywords, ind_risk, func_risk, overall_rate, thresholds):
         self.keywords = keywords
         self.ind_risk = ind_risk
@@ -44,9 +49,11 @@ class FeatureExtractor:
         sentence_count = max(len(re.findall(r'[.!?]+', text_str)), 1)
 
         polarity, subjectivity = get_sentiment(text_str)
+
         emails = len(re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text_str))
         phones = len(re.findall(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', text_str))
         urls = len(re.findall(r'http[s]?://[^\s]+', text_str))
+
         keyword_cnt = sum(kw in text_lower for kw in self.keywords)
         caps_ratio = sum(1 for c in text_str if c.isupper()) / max(len(text_str), 1)
 
@@ -69,9 +76,9 @@ class FeatureExtractor:
             f'{prefix}avg_word_len': np.mean([len(w) for w in words]) if words else 0,
             f'{prefix}avg_sent_len': word_count / sentence_count,
             f'{prefix}caps_ratio': caps_ratio,
-            f'{prefix}high_caps': int(caps_ratio > self.thresholds['caps']),
+            f'{prefix}high_caps': int(caps_ratio > self.thresholds.get('caps', 0.15)),
             f'{prefix}exclaim': text_str.count('!'),
-            f'{prefix}high_exclaim': int(text_str.count('!') > self.thresholds['exclaim']),
+            f'{prefix}high_exclaim': int(text_str.count('!') > self.thresholds.get('exclaim', 3)),
             f'{prefix}question': text_str.count('?'),
             f'{prefix}keyword': keyword_cnt,
             f'{prefix}has_keyword': int(keyword_cnt > 0),
@@ -86,8 +93,8 @@ class FeatureExtractor:
             f'{prefix}contacts': emails + phones,
             f'{prefix}polarity': polarity,
             f'{prefix}subjectivity': subjectivity,
-            f'{prefix}high_polarity': int(polarity > self.thresholds['polarity']),
-            f'{prefix}high_subj': int(subjectivity > self.thresholds['subjectivity']),
+            f'{prefix}high_polarity': int(polarity > self.thresholds.get('polarity', 0.3)),
+            f'{prefix}high_subj': int(subjectivity > self.thresholds.get('subjectivity', 0.5)),
         }
 
     def _empty_features(self, prefix):
@@ -104,12 +111,16 @@ class FeatureExtractor:
 
         text = str(company_profile).lower()
         score = 0
+
         has_awards = int(any(w in text for w in ['award', 'certified', 'accredited']))
         score += has_awards * 0.3
+
         has_partners = int(any(w in text for w in ['partnership', 'partner with', 'collaboration']))
         score += has_partners * 0.25
+
         has_year = int(bool(re.search(r'\b(19|20)\d{2}\b', text)))
         score += has_year * 0.2
+
         score += min(len(company_profile) / 500, 1.0) * 0.25
 
         return {
@@ -156,500 +167,445 @@ class FeatureExtractor:
 
     def transform(self, df):
         features = []
+
         title_feat = df['title'].apply(lambda x: self.extract_text_features(x, 't_'))
         features.append(pd.DataFrame(list(title_feat)))
+
         desc_feat = df['description'].apply(lambda x: self.extract_text_features(x, 'd_'))
         features.append(pd.DataFrame(list(desc_feat)))
+
         req_feat = df['requirements'].apply(lambda x: self.extract_text_features(x, 'r_'))
         features.append(pd.DataFrame(list(req_feat)))
+
         comp_feat = df['company_profile'].apply(self.extract_company_features)
         features.append(pd.DataFrame(list(comp_feat)))
+
         ind_feat = df.apply(lambda row: self.extract_industry_risk(row.get('industry'), row.get('function')), axis=1)
         features.append(pd.DataFrame(list(ind_feat)))
+
         meta_feat = df.apply(self.extract_meta_features, axis=1)
         features.append(pd.DataFrame(list(meta_feat)))
+
         result = pd.concat(features, axis=1)
+
+        result['low_info_urgent'] = ((result['completeness'] < 0.3) & (result['d_urgency'] > 0)).astype(int)
+        result['no_logo_money'] = ((result['has_logo'] == 0) & (result['d_money'] > 2)).astype(int)
+        result['remote_high_subj'] = ((result['telecommute'] == 1) & (result['d_high_subj'] == 1)).astype(int)
+        result['high_risk_low_info'] = ((result['ind_risk'] > result['ind_risk'].mean() * 2) & (result['completeness'] < 0.4)).astype(int)
+        result['no_salary_exag'] = ((result['has_salary'] == 0) & (result['d_exag'] > 2)).astype(int)
+        result['contact_urgent'] = ((result['d_contacts'] > 0) & (result['d_urgency'] > 0)).astype(int)
+
         return result
 
 
-def analyze_fraud_signals(job_data, extractor):
-    signals = []
+class BERTEmbedder:
+    """BERT embedding 생성기"""
+    def __init__(self, model_name='all-MiniLM-L6-v2', n_components=64):
+        self.model = SentenceTransformer(model_name)
+        self.pca = PCA(n_components=n_components, random_state=42)
+        self.pca_fitted = False
+        self.n_components = n_components
+
+    def transform(self, df, fit=False):
+        texts = []
+        for _, row in df.iterrows():
+            title = str(row.get('title', '')).strip()
+            desc = str(row.get('description', '')).strip()
+            text = f"{title} [SEP] {desc}" if title and desc else (title or desc)
+            texts.append(text if text else "empty")
+
+        embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True)
+
+        if fit or not self.pca_fitted:
+            embeddings_reduced = self.pca.fit_transform(embeddings)
+            self.pca_fitted = True
+        else:
+            embeddings_reduced = self.pca.transform(embeddings)
+
+        bert_df = pd.DataFrame(
+            embeddings_reduced,
+            columns=[f'bert_{i}' for i in range(self.n_components)],
+            index=df.index
+        )
+
+        return bert_df
+
+
+# ============================================================================
+# 대시보드용 헬퍼 함수들
+# ============================================================================
+
+def get_feature_contributions(job_data):
+    """각 특성이 사기 점수에 미친 영향 계산"""
+    contributions = []
+
     desc = str(job_data.get('description', '')).lower()
     title = str(job_data.get('title', '')).lower()
 
-    if not job_data.get('has_company_logo'):
-        signals.append("Missing company logo")
-    if not job_data.get('company_profile'):
-        signals.append("No company profile")
+    # 긴급성
+    urgency_words = ['urgent', 'hurry', 'now', 'asap', 'immediately', 'limited time', 'act now']
+    urgency_count = sum(w in desc or w in title for w in urgency_words)
+    if urgency_count > 0:
+        impact = min(urgency_count * 8, 25)
+        contributions.append({
+            'feature': '🚨 Urgency Pressure',
+            'value': f"{urgency_count} keywords",
+            'impact': f"+{impact}%",
+            'explanation': f"Found {urgency_count} urgency words - creates artificial time pressure"
+        })
 
-    urgency = ['urgent', 'hurry', 'now', 'asap', 'immediately']
-    if any(w in desc or w in title for w in urgency):
-        signals.append("Urgency pressure")
+    # 금전 강조
+    money_words = ['$', 'earn', 'income', 'profit', 'cash', 'money', 'dollar']
+    money_count = sum(w in desc or w in title for w in money_words)
+    if money_count > 2:
+        impact = min((money_count - 2) * 5, 20)
+        contributions.append({
+            'feature': '💰 Money Emphasis',
+            'value': f"{money_count} mentions",
+            'impact': f"+{impact}%",
+            'explanation': f"Excessive focus on money - typical fraud tactic"
+        })
 
-    money = ['$', 'earn', 'income', 'profit']
-    if sum(w in desc or w in title for w in money) > 2:
-        signals.append("Excessive money emphasis")
+    # 과장
+    exag_words = ['amazing', 'incredible', 'unbelievable', 'guaranteed', '100%', 'unlimited', 'free']
+    exag_count = sum(w in desc or w in title for w in exag_words)
+    if exag_count > 0:
+        impact = min(exag_count * 10, 25)
+        contributions.append({
+            'feature': '⚡ Exaggerated Claims',
+            'value': f"{exag_count} words",
+            'impact': f"+{impact}%",
+            'explanation': f"Unrealistic promises - red flag for scams"
+        })
 
-    if desc.count('!') + title.count('!') > 3:
-        signals.append(f"Too many exclamations ({desc.count('!')+ title.count('!')})")
+    # 느낌표
+    exclaim_count = desc.count('!') + title.count('!')
+    if exclaim_count > 3:
+        impact = min((exclaim_count - 3) * 3, 15)
+        contributions.append({
+            'feature': '❗ Excessive Punctuation',
+            'value': f"{exclaim_count} exclamations",
+            'impact': f"+{impact}%",
+            'explanation': "Too many exclamation marks - unprofessional"
+        })
 
+    # 연락처
     if '@' in desc:
-        signals.append("Email in description")
+        contributions.append({
+            'feature': '📧 Email in Description',
+            'value': "Detected",
+            'impact': "+15%",
+            'explanation': "Email in description - bypasses platform security"
+        })
 
+    if re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', desc):
+        contributions.append({
+            'feature': '📞 Phone in Description',
+            'value': "Detected",
+            'impact': "+15%",
+            'explanation': "Phone number - moves conversation off-platform"
+        })
+
+    # 정보 완성도
     completeness = sum([
-        job_data.get('has_company_logo', 0),
-        bool(job_data.get('salary_range')),
-        bool(job_data.get('requirements'))
-    ]) / 3
+        int(job_data.get('has_company_logo', 0)),
+        int(bool(job_data.get('salary_range'))),
+        int(bool(job_data.get('company_profile'))),
+        int(bool(job_data.get('requirements'))),
+        int(bool(job_data.get('benefits')))
+    ]) / 5.0
 
-    if completeness < 0.3:
-        signals.append(f"Low information quality ({completeness*100:.0f}%)")
+    if completeness < 0.4:
+        impact = int((0.4 - completeness) * 100)
+        contributions.append({
+            'feature': '📊 Low Information Quality',
+            'value': f"{completeness*100:.0f}% complete",
+            'impact': f"+{impact}%",
+            'explanation': "Missing critical information"
+        })
 
-    return signals
+    if not job_data.get('has_company_logo'):
+        contributions.append({
+            'feature': '❌ No Company Logo',
+            'value': "Missing",
+            'impact': "+12%",
+            'explanation': "Legitimate companies display branding"
+        })
+
+    if not job_data.get('salary_range'):
+        contributions.append({
+            'feature': '💵 No Salary Info',
+            'value': "Missing",
+            'impact': "+8%",
+            'explanation': "Transparency issue"
+        })
+
+    if job_data.get('telecommuting') and completeness < 0.4:
+        contributions.append({
+            'feature': '🚩 High-Risk Pattern',
+            'value': "Remote + Low Info",
+            'impact': "+20%",
+            'explanation': "Common fraud pattern"
+        })
+
+    return contributions
 
 
-def two_stage_defense(job_data, model_dict):
-    df = pd.DataFrame([job_data])
-    extractor = model_dict['extractor']
-    selector = model_dict['selector']
+def predict_fraud(job_data, model_dict):
+    """사기 예측 + 상세 설명"""
+    try:
+        df = pd.DataFrame([job_data])
 
-    X = extractor.transform(df)
-    X_selected = selector.transform(X)
+        extractor = model_dict['domain_extractor']
+        bert_embedder = model_dict['bert_embedder']
+        selector = model_dict['selector']
 
-    balanced_model = model_dict['models']['balanced']
-    if balanced_model.get('is_ensemble'):
-        w = balanced_model['weights']
+        X_domain = extractor.transform(df)
+        X_bert = bert_embedder.transform(df)
+
+        X_hybrid = pd.concat([X_domain.reset_index(drop=True), X_bert.reset_index(drop=True)], axis=1)
+        X_selected = selector.transform(X_hybrid)
+
+        models_bal = model_dict['models_balanced']
+        models_recall = model_dict['models_recall']
+        thresholds = model_dict['thresholds']
+        weights = models_bal['weights']
+
+        # 개별 모델 예측
+        prob_xgb = models_bal['xgb'].predict_proba(X_selected)[0, 1]
+        prob_lgbm = models_bal['lgbm'].predict_proba(X_selected)[0, 1]
+        prob_cat = models_bal['cat'].predict_proba(X_selected)[0, 1]
+        prob_nn = models_bal['nn'].predict_proba(X_selected)[0, 1]
+
+        # 가중 평균
         prob_balanced = (
-            w['xgb'] * balanced_model['xgb'].predict_proba(X_selected)[0,1] +
-            w['lgbm'] * balanced_model['lgbm'].predict_proba(X_selected)[0,1] +
-            w['cat'] * balanced_model['cat'].predict_proba(X_selected)[0,1]
+            weights['xgb'] * prob_xgb +
+            weights['lgbm'] * prob_lgbm +
+            weights['cat'] * prob_cat +
+            weights['nn'] * prob_nn
         )
-    else:
-        prob_balanced = balanced_model['model'].predict_proba(X_selected)[0,1]
 
-    recall_model = model_dict['models']['high_recall']
-    if recall_model.get('is_ensemble'):
+        # High recall
         prob_recall = (
-            recall_model['xgb'].predict_proba(X_selected)[0,1] +
-            recall_model['lgbm'].predict_proba(X_selected)[0,1] +
-            recall_model['cat'].predict_proba(X_selected)[0,1]
+            models_recall['xgb'].predict_proba(X_selected)[0, 1] +
+            models_recall['lgbm'].predict_proba(X_selected)[0, 1] +
+            models_recall['cat'].predict_proba(X_selected)[0, 1]
         ) / 3
-    else:
-        prob_recall = recall_model['model'].predict_proba(X_selected)[0,1]
 
-    if prob_balanced > 0.85:
+        # 결정
+        if prob_balanced > 0.85:
+            action = 'block'
+            explanation = '🚫 AUTO-BLOCKED: High confidence fraud'
+        elif prob_balanced > 0.65:  # Balanced 모델만 보기
+            action = 'review'
+            explanation = '⚠️ MANUAL REVIEW: High risk detected'
+        elif prob_balanced > 0.45 and prob_recall > 0.75:  # 두 모델 다 의심
+            action = 'review'
+            explanation = '⚠️ MANUAL REVIEW: Multiple warning signs'
+        else:
+            action = 'pass'
+            explanation = '✅ APPROVED: No significant fraud signals'
+        contributions = get_feature_contributions(job_data)
+
         return {
-            'action': 'block',
-            'stage': 1,
-            'probability': float(prob_balanced),
-            'confidence': float(prob_balanced * 100),
-            'explanation': 'AUTO-BLOCKED: High confidence fraud detection',
-            'details': analyze_fraud_signals(job_data, extractor)
+            'action': action,
+            'balanced_prob': float(prob_balanced),
+            'recall_prob': float(prob_recall),
+            'explanation': explanation,
+            'contributions': contributions,
+            'model_scores': {
+                'XGBoost': float(prob_xgb),
+                'LightGBM': float(prob_lgbm),
+                'CatBoost': float(prob_cat),
+                'NeuralNet': float(prob_nn)
+            },
+            'weights': weights
         }
-    elif prob_recall > 0.50:
-        return {
-            'action': 'review',
-            'stage': 2,
-            'probability': float(prob_recall),
-            'confidence': float(prob_recall * 100),
-            'explanation': 'MANUAL REVIEW: Suspicious elements detected',
-            'details': analyze_fraud_signals(job_data, extractor)
-        }
-    else:
-        return {
-            'action': 'pass',
-            'stage': None,
-            'probability': float(prob_recall),
-            'confidence': float((1-prob_recall) * 100),
-            'explanation': 'APPROVED: No fraud signals detected',
-            'details': []
-        }
+
+    except Exception as e:
+        st.error(f"Prediction error: {str(e)}")
+        return None
 
 
 # ============================================================================
 # Streamlit UI
 # ============================================================================
 
-st.set_page_config(
-    page_title="Fraud Detection System",
-    page_icon="🛡️",
-    layout="wide"
-)
+st.set_page_config(page_title="Fraud Detection v7", page_icon="🛡️", layout="wide")
 
 st.markdown("""
 <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 1rem;}
-    .stAlert {margin-top: 0.5rem; margin-bottom: 0.5rem;}
-    h1 {color: #1f77b4; font-size: 2.2rem;}
-    h2 {font-size: 1.5rem; margin-top: 1rem;}
-    h3 {font-size: 1.2rem;}
-    .stTabs [data-baseweb="tab-list"] {gap: 2rem;}
+    .block-container {padding-top: 1.5rem;}
+    h1 {color: #1f77b4;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Job Posting Fraud Detection")
-st.caption("2-Stage Defense System powered by ML Ensemble")
+st.title("🛡️ Job Posting Fraud Detection v7")
+st.caption("BERT Hybrid + 4-Model Ensemble + Detailed Explanations")
 st.divider()
 
+# 모델 로드
 @st.cache_resource
 def load_model():
     try:
-        with open('fraud_detection_complete.pkl', 'rb') as f:
-            return pickle.load(f)
-    except:
+        with open('fraud_detection_hybrid_v7.pkl', 'rb') as f:
+            model_dict = pickle.load(f)
+        st.sidebar.success("✅ Model loaded!")
+        return model_dict
+    except Exception as e:
+        st.sidebar.error(f"❌ Load failed: {str(e)}")
         return None
 
-def analyze_job(job_data, model_dict):
-    defaults = {
-        'title': '', 'description': '', 'requirements': '',
-        'company_profile': '', 'benefits': '',
-        'has_company_logo': 0, 'telecommuting': 0,
-        'salary_range': '', 'industry': '', 'function': ''
-    }
-    job_data = {**defaults, **job_data}
-    return two_stage_defense(job_data, model_dict)
+model_dict = load_model()
 
 # Sidebar
 with st.sidebar:
-    st.header("System Status")
-    model_dict = load_model()
-
+    st.header("📊 System Status")
     if model_dict:
-        st.success("✅ Model Active")
-        perf = model_dict.get('performance', {})
+        metadata = model_dict.get('metadata', {})
+        perf = metadata.get('final_performance', {})
+        st.metric("Test AUC", f"{perf.get('hybrid', {}).get('auc', 0):.4f}")
+        st.metric("Test F1", f"{perf.get('hybrid', {}).get('f1', 0):.4f}")
 
-        st.metric("Detection Rate", f"{perf.get('total_recall', 0)*100:.1f}%")
-        st.metric("Auto-Blocked", f"{perf.get('stage1_detected', 0)}")
-        st.metric("Manual Review", f"{perf.get('stage2_detected', 0)}")
-
-        st.divider()
-
-        st.subheader("📊 Understanding Risk Levels")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("""
-            #### Fraud Score Ranges
-            
-            | Score | Risk | Action |
-            |-------|------|--------|
-            | 85%+ | 🔴 Critical | Auto-block |
-            | 50-85% | 🟠 High | Review |
-            | 30-50% | 🟡 Medium | Approve* |
-            | <30% | 🟢 Low | Approve |
-            
-            *Medium risk posts are approved but should be monitored
-            """)
-
-        with col2:
-            st.markdown("##### 📈 Test Results")
-            st.code(f"""
-Total Fraud Cases:  130
-✅ Auto-blocked:    {perf.get('stage1_detected', 0)} (Stage 1)
-✅ In Review:       {perf.get('stage2_detected', 0)} (Stage 2)
-❌ Missed:          {130 - (perf.get('stage1_detected', 0) + perf.get('stage2_detected', 0))}
-
-Detection Rate:    {perf.get('total_recall', 0)*100:.1f}%
-Review Workload:   {perf.get('review_workload', 0)} posts
-            """, language="text")
-            st.markdown("""
-            #### What the scores mean
-            
-            **46% Fraud Score Example:**
-            - 46% chance it's fraud
-            - 54% chance it's legitimate
-            - Below 50% threshold → Approved
-            - But flagged as Medium Risk
-            - Recommended: Monitor this posting
-            
-            **Why we approve 30-50%:**
-            - To avoid false positives
-            - Manual review burden
-            - Business flexibility
-            """)
-
-        st.divider()
-
-        with st.expander("ℹ️ How it works"):
-            st.markdown("""
-            **Risk Levels:**
-            
-            🔴 **CRITICAL** (85%+)  
-            → Auto-blocked immediately
-            
-            🟠 **HIGH** (50-85%)  
-            → Manual review required
-            
-            🟡 **MEDIUM** (30-50%)  
-            → Approved, but monitor
-            
-            🟢 **LOW** (<30%)  
-            → Safe to approve
-            
-            ---
-            
-            **2-Stage System:**
-            - Stage 1: Auto-block (>85%)
-            - Stage 2: Review (50-85%)
-            - Pass: Approve (<50%)
-            """)
-    else:
-        st.error("⚠️ Model Not Found")
-
-# Main Content
+# Main
 if model_dict:
-    tab1, tab2, tab3 = st.tabs(["🔍 Analyze", "⚡ Quick Test", "📊 Performance"])
+    tab1, tab2 = st.tabs(["🔍 Analyze", "⚡ Quick Test"])
 
-    # ========================================================================
-    # TAB 1: Analyze
-    # ========================================================================
     with tab1:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Job Details")
-            title = st.text_input("Job Title *", placeholder="e.g., Senior Software Engineer")
-            company_profile = st.text_area("Company Info", height=80, placeholder="Founded year, certifications...")
+            title = st.text_input("Job Title *")
+            description = st.text_area("Description *", height=150)
+            requirements = st.text_area("Requirements", height=80)
+
+        with col2:
+            company_profile = st.text_area("Company Profile", height=100)
+            benefits = st.text_area("Benefits", height=80)
 
             col_a, col_b = st.columns(2)
             with col_a:
-                industry = st.text_input("Industry")
-            with col_b:
-                function = st.text_input("Function")
-
-            col_c, col_d, col_e = st.columns(3)
-            with col_c:
                 has_logo = st.checkbox("Has Logo")
-            with col_d:
                 telecommuting = st.checkbox("Remote")
-            with col_e:
+            with col_b:
                 salary_range = st.text_input("Salary")
+                industry = st.text_input("Industry")
 
-        with col2:
-            st.subheader("Description")
-            description = st.text_area("Job Description *", height=150, placeholder="Main responsibilities...")
-            requirements = st.text_area("Requirements", height=80, placeholder="Skills, experience...")
-            benefits = st.text_area("Benefits", height=80, placeholder="Health insurance, PTO...")
-
-        st.divider()
-
-        col_btn1, col_btn2 = st.columns([1, 5])
-        with col_btn1:
-            analyze_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
-
-        if analyze_btn:
+        if st.button("🔍 Analyze", type="primary"):
             if not title or not description:
-                st.error("⚠️ Title and Description are required")
+                st.error("Title and Description required")
             else:
-                with st.spinner("Analyzing..."):
-                    job_data = {
-                        'title': title, 'description': description,
-                        'requirements': requirements, 'company_profile': company_profile,
-                        'benefits': benefits, 'has_company_logo': int(has_logo),
-                        'telecommuting': int(telecommuting), 'salary_range': salary_range,
-                        'industry': industry, 'function': function
+                result = predict_fraud({
+                    'title': title,
+                    'description': description,
+                    'requirements': requirements,
+                    'company_profile': company_profile,
+                    'benefits': benefits,
+                    'has_company_logo': int(has_logo),
+                    'telecommuting': int(telecommuting),
+                    'salary_range': salary_range,
+                    'industry': industry,
+                    'function': ''
+                }, model_dict)
+
+                if result:
+                    st.divider()
+
+                    # 결과 표시
+                    fraud_prob = result['balanced_prob']
+
+                    if result['action'] == 'block':
+                        st.error(f"### {result['explanation']}")
+                    elif result['action'] == 'review':
+                        st.warning(f"### {result['explanation']}")
+                    else:
+                        st.success(f"### {result['explanation']}")
+
+                    # 메트릭
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Fraud Score", f"{fraud_prob*100:.1f}%")
+                    col2.metric("Recall Score", f"{result['recall_prob']*100:.1f}%")
+                    col3.metric("Decision", result['action'].upper())
+
+                    # 모델 분석
+                    st.divider()
+                    st.markdown("### 🎯 Why This Score?")
+
+                    # Replace the "Model Breakdown" section (around line 530-540) with this:
+
+                    st.markdown("#### 🤖 Model Breakdown")
+
+                    # Proper mapping from model names to weight keys
+                    model_to_weight = {
+                        'XGBoost': 'xgb',
+                        'LightGBM': 'lgbm',
+                        'CatBoost': 'cat',
+                        'NeuralNet': 'nn'
                     }
-                    result = analyze_job(job_data, model_dict)
 
-                st.divider()
+                    for name, score in result['model_scores'].items():
+                        weight_key = model_to_weight.get(name, name.lower())
+                        weight = result['weights'].get(weight_key, 0)
+                        contribution = score * weight * 100
+                        st.write(f"**{name}:** {score * 100:.1f}% × {weight * 100:.1f}% = {contribution:.1f}%")
 
-                # 위험도 계산
-                fraud_prob = result['probability']
-                if fraud_prob >= 0.85:
-                    risk_level = "CRITICAL"
-                    risk_color = "🔴"
-                    risk_emoji = "🚨"
-                elif fraud_prob >= 0.50:
-                    risk_level = "HIGH"
-                    risk_color = "🟠"
-                    risk_emoji = "⚠️"
-                elif fraud_prob >= 0.30:
-                    risk_level = "MEDIUM"
-                    risk_color = "🟡"
-                    risk_emoji = "⚡"
-                else:
-                    risk_level = "LOW"
-                    risk_color = "🟢"
-                    risk_emoji = "✅"
+                    st.write(f"**→ Final: {fraud_prob * 100:.1f}%**")
+                    # 특성 기여도
+                    if result['contributions']:
+                        st.divider()
+                        st.markdown("#### 🔍 Feature Contributions")
 
-                if result['action'] == 'block':
-                    st.error(f"### 🚫 {result['explanation']}")
+                        for c in result['contributions']:
+                            col1, col2, col3 = st.columns([3, 1, 1])
+                            col1.write(f"**{c['feature']}**")
+                            col1.caption(c['explanation'])
+                            col2.metric("Value", c['value'])
+                            col3.metric("Impact", c['impact'])
+                            st.markdown("---")
 
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Fraud Score", f"{result['probability']*100:.1f}%",
-                               delta=f"Critical", delta_color="inverse")
-                    col2.metric("Risk Level", f"{risk_emoji} {risk_level}")
-                    col3.metric("Decision", "🚫 BLOCKED")
-
-                    st.error(f"**Action Required:** This posting is automatically blocked due to high fraud probability.")
-
-                elif result['action'] == 'review':
-                    st.warning(f"### ⚠️ {result['explanation']}")
-
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Fraud Score", f"{result['probability']*100:.1f}%",
-                               delta=f"High Risk", delta_color="inverse")
-                    col2.metric("Risk Level", f"{risk_emoji} {risk_level}")
-                    col3.metric("Decision", "👁️ REVIEW")
-
-                    st.warning(f"**Action Required:** Manual review recommended. Check fraud signals below.")
-
-                else:
-                    # APPROVED 케이스
-                    if fraud_prob >= 0.30:
-                        # Medium Risk (30-50%)
-                        st.warning(f"### ⚡ APPROVED (Medium Risk)")
-                        st.caption("✅ Approved, but monitor closely - fraud score is moderately elevated")
-
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Fraud Score", f"{result['probability']*100:.1f}%",
-                                   delta=f"Monitor", delta_color="normal")
-                        col2.metric("Risk Level", f"{risk_emoji} {risk_level}")
-                        col3.metric("Decision", "✅ APPROVED*")
-
-                        st.info(f"**Note:** Fraud probability is {result['probability']*100:.0f}% (below 50% threshold). "
-                               f"This is approved but recommended for monitoring.")
-                    else:
-                        # Low Risk (<30%)
-                        st.success(f"### ✅ {result['explanation']}")
-                        st.caption("Safe to proceed - very low fraud indicators")
-
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Fraud Score", f"{result['probability']*100:.1f}%",
-                                   delta=f"Safe", delta_color="normal")
-                        col2.metric("Risk Level", f"{risk_emoji} {risk_level}")
-                        col3.metric("Decision", "✅ APPROVED")
-
-                if result.get('details'):
-                    with st.expander("🔍 Fraud Signals Detected"):
-                        for signal in result['details']:
-                            st.markdown(f"• {signal}")
-
-    # ========================================================================
-    # TAB 2: Quick Test
-    # ========================================================================
     with tab2:
-        st.subheader("Quick Test Cases")
-        st.caption("Test the system with predefined examples")
+        st.subheader("Quick Tests")
 
-        col1, col2, col3 = st.columns(3)
+        if st.button("🚨 Test Fraud Case"):
+            result = predict_fraud({
+                'title': 'URGENT! Make $5000/week!!!',
+                'description': 'Amazing! Earn money fast! Email: scam@email.com',
+                'requirements': '',
+                'company_profile': '',
+                'benefits': '',
+                'has_company_logo': 0,
+                'telecommuting': 1,
+                'salary_range': '',
+                'industry': '',
+                'function': ''
+            }, model_dict)
 
-        with col1:
-            st.markdown("##### 🚨 Obvious Fraud")
-            st.caption("Expected: AUTO-BLOCKED")
-            if st.button("Run Test 1", use_container_width=True):
-                with st.spinner("Analyzing..."):
-                    result = analyze_job({
-                        'title': 'Work From Home - Earn $5000/week!',
-                        'description': 'URGENT! Make EASY money NOW! Email: scam@fake.com. No experience needed!',
-                        'has_company_logo': 0, 'telecommuting': 1
-                    }, model_dict)
+            if result:
+                st.metric("Score", f"{result['balanced_prob']*100:.1f}%")
+                st.write(f"Decision: **{result['action'].upper()}**")
 
-                    fraud_score = result['probability']*100
-                    if result['action'] == 'block':
-                        st.error(f"🚫 **BLOCKED** | Fraud Score: {fraud_score:.0f}%")
-                    elif result['action'] == 'review':
-                        st.warning(f"⚠️ **REVIEW NEEDED** | Fraud Score: {fraud_score:.0f}%")
-                    else:
-                        if fraud_score >= 30:
-                            st.warning(f"⚡ **APPROVED** (Medium Risk: {fraud_score:.0f}%)")
-                        else:
-                            st.success(f"✅ **APPROVED** (Low Risk: {fraud_score:.0f}%)")
+        if st.button("✅ Test Legitimate Case"):
+            result = predict_fraud({
+                'title': 'Senior Software Engineer',
+                'description': 'Seeking experienced engineer for our team.',
+                'requirements': 'BS CS, 5+ years Python',
+                'company_profile': 'Tech company since 2005',
+                'benefits': 'Health, 401k',
+                'has_company_logo': 1,
+                'telecommuting': 0,
+                'salary_range': '$120k-$150k',
+                'industry': 'IT',
+                'function': 'Engineering'
+            }, model_dict)
 
-        with col2:
-            st.markdown("##### ⚠️ Suspicious")
-            st.caption("Expected: MANUAL REVIEW")
-            if st.button("Run Test 2", use_container_width=True):
-                with st.spinner("Analyzing..."):
-                    result = analyze_job({
-                        'title': 'Sales Rep - High Earning',
-                        'description': 'Great income opportunity! Flexible hours.',
-                        'has_company_logo': 0, 'telecommuting': 1
-                    }, model_dict)
-
-                    if result['action'] == 'block':
-                        st.error(f"**BLOCKED** ({result['probability']*100:.0f}%)")
-                    elif result['action'] == 'review':
-                        st.warning(f"**REVIEW** ({result['probability']*100:.0f}%)")
-                    else:
-                        st.success(f"**PASSED** ({result['probability']*100:.0f}%)")
-
-        with col3:
-            st.markdown("##### ✅ Legitimate")
-            st.caption("Expected: APPROVED")
-            if st.button("Run Test 3", use_container_width=True):
-                with st.spinner("Analyzing..."):
-                    result = analyze_job({
-                        'title': 'Senior Software Engineer',
-                        'description': 'Seeking experienced engineer. Competitive salary and benefits.',
-                        'company_profile': 'Tech company founded 2010, ISO certified',
-                        'requirements': 'BS in CS, 5+ years experience',
-                        'has_company_logo': 1, 'salary_range': '$120k-150k'
-                    }, model_dict)
-
-                    if result['action'] == 'block':
-                        st.error(f"**BLOCKED** ({result['probability']*100:.0f}%)")
-                    elif result['action'] == 'review':
-                        st.warning(f"**REVIEW** ({result['probability']*100:.0f}%)")
-                    else:
-                        st.success(f"**PASSED** ({result['probability']*100:.0f}%)")
-
-    # ========================================================================
-    # TAB 3: Performance
-    # ========================================================================
-    with tab3:
-        st.subheader("System Performance Metrics")
-
-        perf = model_dict.get('performance', {})
-        config = model_dict.get('two_stage_config', {})
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Detection Rate", f"{perf.get('total_recall', 0)*100:.1f}%",
-                   help="% of fraud detected")
-        col2.metric("Auto-Blocked", f"{perf.get('stage1_detected', 0)}",
-                   help="Automatically blocked frauds")
-        col3.metric("Review Queue", f"{perf.get('stage2_detected', 0)}",
-                   help="Frauds caught in manual review")
-        col4.metric("Workload", f"{perf.get('review_workload', 0)}",
-                   help="Total posts requiring review")
-
-        st.divider()
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("##### ⚙️ Thresholds")
-            st.code(f"""
-Stage 1 (Auto-block):  {config.get('stage1_threshold', 0.85)} (85%)
-Stage 2 (Review):      {config.get('stage2_threshold', 0.50)} (50%)
-
-Risk Levels:
-- Critical: 85%+  (Auto-block)
-- High:     50-85% (Review)
-- Medium:   30-50% (Approve with caution)
-- Low:      <30%   (Safe)
-            """, language="text")
-
-        with col2:
-            st.markdown("##### 📈 Model Stack")
-            st.info("""
-            **Ensemble of 3 Models:**
-            - XGBoost
-            - LightGBM  
-            - CatBoost
-            
-            **Features:** 46 selected from 91
-            """)
+            if result:
+                st.metric("Score", f"{result['balanced_prob']*100:.1f}%")
+                st.write(f"Decision: **{result['action'].upper()}**")
 
 else:
     st.error("### ⚠️ Model Not Loaded")
-    st.info("""
-    **Steps to fix:**
-    1. Run `fraud_detection_complete.py` to train model
-    2. Ensure `fraud_detection_complete.pkl` exists
-    3. Restart this dashboard
-    """)
+    st.info("Please run: `python fraud_detection_complete_v7.py`")
 
 st.divider()
-st.caption("🛡️ Fraud Detection System v3.0 | XGBoost + LightGBM + CatBoost")
+st.caption("🛡️ Fraud Detection v7")
+
