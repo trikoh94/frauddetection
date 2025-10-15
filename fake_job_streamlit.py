@@ -1,6 +1,9 @@
 """
-Job Posting Fraud Detection Dashboard v7 - REDESIGNED
-Streamlit Cloud 배포용 + 디자인 개선
+Job Posting Fraud Detection Dashboard v7 - FINAL
+✅ NLTK 제거 (간단한 감성 분석)
+✅ 판정 로직 개선 (threshold 상향)
+✅ 2탭 구조 (Analyze + About)
+✅ 깔끔한 디자인
 """
 
 import streamlit as st
@@ -13,45 +16,49 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# NLTK/TextBlob 초기화
-# ============================================================================
-import nltk
-import ssl
-
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
-else:
-    ssl._create_default_https_context = _create_unverified_https_context
-
-@st.cache_resource
-def download_nltk_data():
-    for pkg in ['brown', 'punkt', 'wordnet', 'averaged_perceptron_tagger']:
-        try:
-            nltk.data.find(f'corpora/{pkg}')
-        except:
-            try:
-                nltk.data.find(f'tokenizers/{pkg}')
-            except:
-                nltk.download(pkg, quiet=True)
-
-download_nltk_data()
-from textblob import TextBlob
-
-# ============================================================================
-# 클래스 정의
+# 간단한 감성 분석 (NLTK 대체)
 # ============================================================================
 
 @lru_cache(maxsize=1000)
 def get_sentiment(text):
-    """캐싱된 감성 분석"""
+    """간단하지만 효과적인 감성 분석"""
     try:
-        blob = TextBlob(text)
-        return blob.sentiment.polarity, blob.sentiment.subjectivity
+        text_lower = str(text).lower()
+        words = text_lower.split()
+
+        if not words:
+            return 0.0, 0.0
+
+        # 긍정 단어
+        positive = ['excellent', 'great', 'professional', 'qualified', 'experienced',
+                   'certified', 'established', 'reputable', 'growth', 'benefits',
+                   'competitive', 'comprehensive', 'innovative', 'leading']
+
+        # 부정/사기 단어
+        negative = ['urgent', 'hurry', 'asap', 'now', 'must', 'easy', 'fast',
+                   'instant', 'guarantee', 'limited', 'act', 'immediately',
+                   'incredible', 'amazing', 'unbelievable', 'free', 'unlimited']
+
+        pos_count = sum(1 for word in words if word in positive)
+        neg_count = sum(1 for word in words if word in negative)
+
+        total = pos_count + neg_count
+        if total == 0:
+            polarity = 0.0
+        else:
+            polarity = (pos_count - neg_count) / total
+
+        # 주관성: 감정 단어 비율
+        subjectivity = min(total / len(words) * 10, 1.0)
+
+        return polarity, subjectivity
     except:
         return 0.0, 0.0
 
+
+# ============================================================================
+# 클래스 정의
+# ============================================================================
 
 class FeatureExtractor:
     """도메인 특성 추출기"""
@@ -411,23 +418,29 @@ def predict_fraud(job_data, model_dict):
             models_recall['cat'].predict_proba(X_selected)[0, 1]
         ) / 3
 
+        # ✅ 개선된 판정 로직 (threshold 상향!)
         if prob_balanced > 0.85:
             action = 'block'
-            explanation = '🚫 AUTO-BLOCKED: High confidence fraud'
-        elif prob_balanced > 0.65:
+            explanation = '🚫 AUTO-BLOCKED: High confidence fraud detected'
+            color = 'error'
+        elif prob_balanced > 0.75:
             action = 'review'
-            explanation = '⚠️ MANUAL REVIEW: High risk detected'
-        elif prob_balanced > 0.45 and prob_recall > 0.75:
+            explanation = '⚠️ MANUAL REVIEW: Suspicious patterns detected'
+            color = 'warning'
+        elif prob_balanced > 0.60 and prob_recall > 0.80:
             action = 'review'
-            explanation = '⚠️ MANUAL REVIEW: Multiple warning signs'
+            explanation = '⚠️ MANUAL REVIEW: Multiple risk factors found'
+            color = 'warning'
         else:
             action = 'pass'
-            explanation = '✅ APPROVED: No significant fraud signals'
+            explanation = '✅ APPROVED: No significant fraud signals detected'
+            color = 'success'
 
         contributions = get_feature_contributions(job_data)
 
         return {
             'action': action,
+            'color': color,
             'balanced_prob': float(prob_balanced),
             'recall_prob': float(prob_recall),
             'explanation': explanation,
@@ -447,25 +460,23 @@ def predict_fraud(job_data, model_dict):
 
 
 # ============================================================================
-# Streamlit UI - 디자인 개선!
+# Streamlit UI
 # ============================================================================
 
 st.set_page_config(
-    page_title="Fraud Detection AI",
+    page_title="Job Fraud Detection AI",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS - 현대적 디자인
+# Custom CSS
 st.markdown("""
 <style>
-    /* 전체 배경 */
     .stApp {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     }
     
-    /* 메인 컨테이너 */
     .block-container {
         padding-top: 2rem;
         padding-bottom: 2rem;
@@ -474,7 +485,6 @@ st.markdown("""
         box-shadow: 0 10px 40px rgba(0,0,0,0.1);
     }
     
-    /* 헤더 스타일 */
     h1 {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         -webkit-background-clip: text;
@@ -484,16 +494,6 @@ st.markdown("""
         margin-bottom: 0.5rem !important;
     }
     
-    /* 카드 스타일 */
-    .metric-card {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-        padding: 1.5rem;
-        border-radius: 15px;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-        margin: 0.5rem 0;
-    }
-    
-    /* 버튼 스타일 */
     .stButton>button {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -510,7 +510,6 @@ st.markdown("""
         box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
     }
     
-    /* 텍스트 입력 */
     .stTextInput>div>div>input, .stTextArea>div>div>textarea {
         border-radius: 10px;
         border: 2px solid #e0e0e0;
@@ -522,14 +521,12 @@ st.markdown("""
         box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
     }
     
-    /* 메트릭 */
     [data-testid="stMetricValue"] {
         font-size: 2rem;
         font-weight: 700;
         color: #667eea;
     }
     
-    /* 사이드바 */
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
     }
@@ -538,7 +535,6 @@ st.markdown("""
         color: white !important;
     }
     
-    /* 구분선 */
     hr {
         margin: 2rem 0;
         border: none;
@@ -546,19 +542,10 @@ st.markdown("""
         background: linear-gradient(90deg, transparent, #667eea, transparent);
     }
     
-    /* Success/Warning/Error 박스 */
-    .stAlert {
-        border-radius: 15px;
-        border-left: 5px solid;
-        padding: 1rem 1.5rem;
-    }
-    
-    /* 프로그레스 바 */
     .stProgress > div > div {
         background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
     }
     
-    /* 탭 스타일 */
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
     }
@@ -580,7 +567,7 @@ st.markdown("""
 st.title("🛡️ Job Posting Fraud Detection")
 st.markdown("""
 <p style='font-size: 1.2rem; color: #666; margin-top: -1rem;'>
-    AI-Powered Security System • BERT Hybrid + Ensemble ML
+    AI-Powered Security System • BERT + Ensemble ML
 </p>
 """, unsafe_allow_html=True)
 
@@ -609,31 +596,31 @@ with st.sidebar:
         st.markdown("#### Model Performance")
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("AUC", f"{perf.get('hybrid', {}).get('auc', 0):.3f}", delta="Best")
+            st.metric("AUC", f"{perf.get('hybrid', {}).get('auc', 0):.3f}")
         with col2:
-            st.metric("F1", f"{perf.get('hybrid', {}).get('f1', 0):.3f}", delta="Optimized")
+            st.metric("F1", f"{perf.get('hybrid', {}).get('f1', 0):.3f}")
 
         st.markdown("---")
         st.markdown("#### 🤖 AI Components")
         st.markdown("""
         - ✅ BERT Language Model
-        - ✅ XGBoost Classifier
-        - ✅ LightGBM Classifier
-        - ✅ CatBoost Classifier
+        - ✅ XGBoost Ensemble
+        - ✅ LightGBM Ensemble
+        - ✅ CatBoost Ensemble
         - ✅ Neural Network
         """)
 
         st.markdown("---")
-        st.markdown("#### 🔒 Security Levels")
+        st.markdown("#### 🔒 Decision Thresholds")
         st.markdown("""
         **🚫 AUTO-BLOCK**  
-        Fraud score > 85%
+        Score > 85%
         
-        **⚠️ REVIEW**  
-        Fraud score 45-85%
+        **⚠️ MANUAL REVIEW**  
+        Score 60-85%
         
         **✅ APPROVE**  
-        Fraud score < 45%
+        Score < 60%
         """)
     else:
         st.error("⚠️ Model not loaded")
@@ -642,7 +629,7 @@ st.markdown("---")
 
 # Main Content
 if model_dict:
-    tab1, tab2, tab3 = st.tabs(["🔍 Analyze Job Posting", "⚡ Quick Tests", "📖 About"])
+    tab1, tab2 = st.tabs(["🔍 Analyze Job Posting", "📖 About This System"])
 
     with tab1:
         st.markdown("### Enter Job Posting Details")
@@ -650,7 +637,7 @@ if model_dict:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("#### 📝 Basic Information")
+            st.markdown("#### 📝 Job Information")
             title = st.text_input("Job Title *", placeholder="e.g., Software Engineer")
             description = st.text_area(
                 "Job Description *",
@@ -664,7 +651,7 @@ if model_dict:
             )
 
         with col2:
-            st.markdown("#### 🏢 Company Information")
+            st.markdown("#### 🏢 Company Details")
             company_profile = st.text_area(
                 "Company Profile",
                 height=100,
@@ -678,10 +665,10 @@ if model_dict:
 
             col_a, col_b = st.columns(2)
             with col_a:
-                has_logo = st.checkbox("✓ Has Company Logo")
-                telecommuting = st.checkbox("🏠 Remote Work")
+                has_logo = st.checkbox("✓ Company Logo")
+                telecommuting = st.checkbox("🏠 Remote")
             with col_b:
-                salary_range = st.text_input("💰 Salary Range", placeholder="$80k-$120k")
+                salary_range = st.text_input("💰 Salary", placeholder="$80k-$120k")
                 industry = st.text_input("🏭 Industry", placeholder="e.g., IT")
 
         st.markdown("")
@@ -710,58 +697,54 @@ if model_dict:
                 if result:
                     st.markdown("---")
 
-                    # 결과 헤더
+                    # 결과 표시
                     fraud_prob = result['balanced_prob']
 
-                    if result['action'] == 'block':
+                    if result['color'] == 'error':
                         st.error(f"### {result['explanation']}")
-                        st.progress(fraud_prob)
-                    elif result['action'] == 'review':
+                    elif result['color'] == 'warning':
                         st.warning(f"### {result['explanation']}")
-                        st.progress(fraud_prob)
                     else:
                         st.success(f"### {result['explanation']}")
-                        st.progress(fraud_prob)
 
-                    # 메트릭 카드
+                    st.progress(fraud_prob)
+
+                    # 메트릭
                     st.markdown("### 📊 Risk Assessment")
                     col1, col2, col3, col4 = st.columns(4)
 
                     with col1:
                         st.metric(
                             "Fraud Score",
-                            f"{fraud_prob*100:.1f}%",
-                            delta=f"{(fraud_prob-0.5)*100:+.1f}% vs avg"
+                            f"{fraud_prob*100:.1f}%"
                         )
                     with col2:
                         st.metric(
-                            "Recall Score",
-                            f"{result['recall_prob']*100:.1f}%",
-                            delta="Sensitivity"
+                            "Sensitivity",
+                            f"{result['recall_prob']*100:.1f}%"
                         )
                     with col3:
-                        decision_color = {
+                        decision_emoji = {
                             'block': '🚫',
                             'review': '⚠️',
                             'pass': '✅'
                         }
                         st.metric(
                             "Decision",
-                            f"{decision_color[result['action']]} {result['action'].upper()}"
+                            f"{decision_emoji[result['action']]} {result['action'].upper()}"
                         )
                     with col4:
                         confidence = max(fraud_prob, 1-fraud_prob)
                         st.metric(
                             "Confidence",
-                            f"{confidence*100:.1f}%",
-                            delta="AI Certainty"
+                            f"{confidence*100:.1f}%"
                         )
 
                     # 모델 분석
                     st.markdown("---")
-                    st.markdown("### 🤖 AI Model Analysis")
+                    st.markdown("### 🤖 AI Model Breakdown")
 
-                    with st.expander("📈 Individual Model Scores", expanded=True):
+                    with st.expander("📈 Individual Model Scores", expanded=False):
                         model_to_weight = {
                             'XGBoost': 'xgb',
                             'LightGBM': 'lgbm',
@@ -779,12 +762,12 @@ if model_dict:
                                 st.markdown(f"**{name}**")
                             with col2:
                                 st.progress(score)
-                                st.caption(f"{score*100:.1f}%")
+                                st.caption(f"Score: {score*100:.1f}%")
                             with col3:
                                 st.markdown(f"Weight: {weight*100:.0f}%")
                                 st.caption(f"→ {contribution:.1f}%")
 
-                        st.markdown(f"**Final Ensemble Score: {fraud_prob*100:.1f}%**")
+                        st.markdown(f"**Final Weighted Score: {fraud_prob*100:.1f}%**")
 
                     # 특성 기여도
                     if result['contributions']:
@@ -792,130 +775,118 @@ if model_dict:
                         st.markdown("### 🔍 Risk Factors Detected")
 
                         for i, c in enumerate(result['contributions']):
-                            with st.container():
-                                col1, col2, col3 = st.columns([4, 1, 1])
-                                with col1:
-                                    st.markdown(f"**{c['feature']}**")
-                                    st.caption(c['explanation'])
-                                with col2:
-                                    st.metric("Value", c['value'])
-                                with col3:
-                                    st.metric("Impact", c['impact'])
+                            col1, col2, col3 = st.columns([4, 1, 1])
+                            with col1:
+                                st.markdown(f"**{c['feature']}**")
+                                st.caption(c['explanation'])
+                            with col2:
+                                st.metric("Value", c['value'])
+                            with col3:
+                                st.metric("Impact", c['impact'])
 
-                                if i < len(result['contributions']) - 1:
-                                    st.markdown("<hr style='margin: 0.5rem 0; opacity: 0.3;'>", unsafe_allow_html=True)
+                            if i < len(result['contributions']) - 1:
+                                st.markdown("<hr style='margin: 0.5rem 0; opacity: 0.2;'>", unsafe_allow_html=True)
 
     with tab2:
-        st.markdown("### ⚡ Quick Test Cases")
-        st.markdown("Test the system with pre-defined examples")
+        st.markdown("### 📖 About This System")
 
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("#### 🚨 Fraud Example")
-            if st.button("Test Suspicious Posting", use_container_width=True):
-                with st.spinner('Analyzing...'):
-                    result = predict_fraud({
-                        'title': 'URGENT! Make $5000/week!!!',
-                        'description': 'Amazing opportunity! Earn money fast! No experience needed! Contact: scam@email.com',
-                        'requirements': '',
-                        'company_profile': '',
-                        'benefits': '',
-                        'has_company_logo': 0,
-                        'telecommuting': 1,
-                        'salary_range': '',
-                        'industry': '',
-                        'function': ''
-                    }, model_dict)
-
-                if result:
-                    st.metric("Fraud Score", f"{result['balanced_prob']*100:.1f}%")
-                    st.metric("Decision", f"**{result['action'].upper()}**")
-                    if result['action'] == 'block':
-                        st.error(result['explanation'])
-                    else:
-                        st.warning(result['explanation'])
+            st.markdown("""
+            #### 🎯 Purpose
+            This AI system protects job seekers from fraudulent postings by analyzing 
+            linguistic patterns, structural anomalies, and behavioral indicators.
+            
+            #### 🧠 Technology
+            - **BERT**: Advanced language understanding
+            - **Ensemble ML**: 4 specialized models
+            - **100+ Features**: Custom fraud indicators
+            - **Real-time**: Sub-second analysis
+            
+            #### 🔒 Security Levels
+            
+            **🚫 Auto-Block (85%+)**
+            - High-confidence fraud
+            - Immediate action
+            - No human review needed
+            
+            **⚠️ Manual Review (60-85%)**
+            - Suspicious patterns
+            - Human verification required
+            - Additional context needed
+            
+            **✅ Approved (<60%)**
+            - Low fraud probability
+            - Safe to proceed
+            - Standard processing
+            """)
 
         with col2:
-            st.markdown("#### ✅ Legitimate Example")
-            if st.button("Test Legitimate Posting", use_container_width=True):
-                with st.spinner('Analyzing...'):
-                    result = predict_fraud({
-                        'title': 'Senior Software Engineer',
-                        'description': 'We are seeking an experienced software engineer to join our development team.',
-                        'requirements': 'BS in Computer Science, 5+ years Python experience',
-                        'company_profile': 'Established technology company since 2005',
-                        'benefits': 'Health insurance, 401k, flexible hours',
-                        'has_company_logo': 1,
-                        'telecommuting': 0,
-                        'salary_range': '$120,000 - $150,000',
-                        'industry': 'Information Technology',
-                        'function': 'Engineering'
-                    }, model_dict)
+            st.markdown("""
+            #### 🎯 Detection Capabilities
+            
+            ✅ **Urgency Manipulation**
+            - "ASAP", "NOW", "LIMITED TIME"
+            - Artificial pressure tactics
+            
+            ✅ **Money Emphasis**
+            - Excessive salary mentions
+            - "Earn $X fast" patterns
+            
+            ✅ **Exaggerated Claims**
+            - "Guaranteed", "100%", "Unlimited"
+            - Unrealistic promises
+            
+            ✅ **Information Quality**
+            - Missing company details
+            - No salary transparency
+            - Incomplete descriptions
+            
+            ✅ **Contact Patterns**
+            - Email/phone in description
+            - Off-platform communication
+            
+            ✅ **Industry Risk**
+            - High-fraud sectors
+            - Remote + low info patterns
+            
+            #### 📊 Performance
+            - **AUC**: 0.95+ (Excellent)
+            - **Recall**: 90%+ (Catches fraud)
+            - **Precision**: 85%+ (Low false positives)
+            - **F1 Score**: 0.90+ (Balanced)
+            """)
 
-                if result:
-                    st.metric("Fraud Score", f"{result['balanced_prob']*100:.1f}%")
-                    st.metric("Decision", f"**{result['action'].upper()}**")
-                    if result['action'] == 'pass':
-                        st.success(result['explanation'])
-                    else:
-                        st.warning(result['explanation'])
+        st.markdown("---")
 
-    with tab3:
-        st.markdown("### 📖 About This System")
-
-        st.markdown("""
-        #### 🎯 Purpose
-        This AI-powered system protects job seekers from fraudulent job postings by analyzing
-        multiple linguistic and structural patterns.
-        
-        #### 🧠 Technology Stack
-        - **BERT**: State-of-the-art language model for semantic understanding
-        - **Ensemble ML**: 4 advanced models (XGBoost, LightGBM, CatBoost, Neural Network)
-        - **Feature Engineering**: 100+ custom fraud indicators
-        - **Real-time Analysis**: Sub-second prediction speed
-        
-        #### 🎯 Detection Capabilities
-        - ✅ Urgency manipulation (ASAP, NOW, etc.)
-        - ✅ Money emphasis patterns
-        - ✅ Exaggerated claims
-        - ✅ Missing company information
-        - ✅ Contact information in description
-        - ✅ Industry risk assessment
-        - ✅ Linguistic anomalies
-        
-        #### 📊 Performance Metrics
-        - **AUC Score**: 0.95+ (Excellent discrimination)
-        - **Recall**: 90%+ (Catches most fraud)
-        - **Precision**: 85%+ (Low false positives)
-        - **F1 Score**: 0.90+ (Balanced performance)
-        
-        #### 🔒 Security Workflow
-        1. **Automated Screening**: High-confidence fraud is auto-blocked
-        2. **Manual Review**: Suspicious cases flagged for human review
-        3. **Safe Approval**: Clean postings approved instantly
-        
-        #### 👨‍💻 Developed By
-        Advanced ML System • 2024
+        st.info("""
+        💡 **Tips for Best Results**
+        - Provide complete job posting information
+        - Include company profile if available
+        - Add salary range for transparency check
+        - Specify industry for risk assessment
         """)
 
-        st.info("💡 **Tip**: For best results, provide complete job posting information including company details and salary range.")
+        st.markdown("""
+        <div style='text-align: center; padding: 2rem 0;'>
+            <p style='color: #666;'><strong>Built with:</strong> BERT • XGBoost • LightGBM • CatBoost • Neural Networks</p>
+            <p style='color: #999; font-size: 0.9rem;'>Streamlit • scikit-learn • PyTorch</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 else:
     st.error("### ⚠️ System Error")
     st.markdown("""
     The AI model could not be loaded. Please ensure:
-    - `fraud_detection_hybrid_v7.pkl` is in the same directory
+    - `fraud_detection_hybrid_v7.pkl` exists in the directory
     - All required packages are installed
     - The model file is not corrupted
-    
-    Contact support if the problem persists.
     """)
 
 st.markdown("---")
 st.markdown("""
-<div style='text-align: center; color: #666; padding: 2rem 0;'>
-    <p style='font-size: 0.9rem;'>🛡️ Job Fraud Detection System v7.0</p>
-    <p style='font-size: 0.8rem;'>Powered by BERT + Ensemble ML • Built with Streamlit</p>
+<div style='text-align: center; color: #666; padding: 1rem 0;'>
+    🛡️ Job Fraud Detection System v7.0 | Powered by AI
 </div>
 """, unsafe_allow_html=True)
